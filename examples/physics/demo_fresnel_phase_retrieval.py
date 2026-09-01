@@ -22,8 +22,6 @@ corrected measurements from disk.
 # All lengths below use metres. The wavelength corresponds approximately to a
 # 20 keV X-ray beam. ``distances[j]`` must describe the same plane as
 # ``measurements[j]``.
-from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -97,56 +95,52 @@ class MultiDistanceFresnel(dinv.physics.LinearPhysics):
         # B^* B = n_distances I for the vertically stacked operator B.
         return self.A_adjoint(y) / len(self.propagators)
 
+# %%
+# Getting the data
+
+DATA_PATH = None
+if DATA_PATH is None:  # Generate synthetic data
+    width, height = 128, 128
+    img_size = (1, height, width)
+    axis_y = torch.linspace(-1, 1, height, device=device)
+    axis_x = torch.linspace(-1, 1, width, device=device)
+    grid_y, grid_x = torch.meshgrid(axis_y, axis_x, indexing="ij")
+
+    disk = ((grid_x + 0.18).square() + (grid_y + 0.08).square() < 0.32**2).float()
+    small_disk = ((grid_x - 0.30).square() + (grid_y - 0.22).square() < 0.14**2).float()
+    smooth_feature = torch.exp(
+        -((grid_x - 0.20).square() + (grid_y + 0.28).square()) / 0.08
+    )
+
+    phase_true = (0.9 * disk + 0.55 * small_disk + 0.35 * smooth_feature)[None, None]
+    absorption_true = (0.10 * disk + 0.04 * small_disk)[None, None]
+    transmission_true = torch.exp(-absorption_true - 1j * phase_true)
+    
+
+else:  # Load measured data
+    measurements = np.load(DATA_PATH)
+    img_size = measurements.shape
+    measurements = torch.from_numpy(measurements).float().to(device)
+
 
 # %%
-# Using measured intensities
-# --------------------------
-#
-# Set these paths to arrays of raw, dark, and flat images with shape
-# ``(n_distances, H, W)``. If the first array is already flat-field normalized,
-# set ``MEASUREMENTS_ARE_NORMALIZED=True`` and leave the other paths unset.
-# Leave ``MEASUREMENTS_PATH`` as ``None`` to run the synthetic example. The
-# loading branch infers ``H`` and ``W`` from the data.
-#
-# A detector mask can be used to exclude dead, saturated, or otherwise invalid
-# pixels from the loss below. With magnifying cone-beam geometry, use the
-# effective object-plane pixel size and the corresponding effective propagation
-# distance rather than the raw detector pitch and sample-detector distance.
-MEASUREMENTS_PATH: Path | None = None
-DARK_PATH: Path | None = None
-FLAT_PATH: Path | None = None
-MEASUREMENTS_ARE_NORMALIZED = False
+# Defining the Operator
+B = MultiDistanceFresnel(
+    img_size=img_size,
+    distances=distances,
+    wavelength=wavelength,
+    pixel_size=pixel_size,
+    device=device,
+)
+transmission_phase_retrieval = dinv.physics.PhaseRetrieval(B=B)
 
-using_measured_data = MEASUREMENTS_PATH is not None
-measurements = None
-
-if using_measured_data:
-    counts = torch.from_numpy(np.load(MEASUREMENTS_PATH)).float().to(device)
-    if counts.ndim != 3 or counts.shape[0] != len(distances):
-        raise ValueError(
-            "Expected raw measurements with shape (n_distances, H, W), got "
-            f"{tuple(counts.shape)}."
+if DATA_PATH is None:
+    with torch.no_grad():
+        clean_intensity = transmission_phase_retrieval.A(transmission_true)
+        photons_per_pixel = 2.0e4
+        measurements = (
+            torch.poisson(photons_per_pixel * clean_intensity) / photons_per_pixel
         )
-
-    if MEASUREMENTS_ARE_NORMALIZED:
-        normalized = counts.clamp_min(0)
-    else:
-        if DARK_PATH is None or FLAT_PATH is None:
-            raise ValueError(
-                "DARK_PATH and FLAT_PATH are required for raw measurements."
-            )
-        dark = torch.from_numpy(np.load(DARK_PATH)).float().to(device)
-        flat = torch.from_numpy(np.load(FLAT_PATH)).float().to(device)
-        normalized = ((counts - dark) / (flat - dark).clamp_min(1e-6)).clamp_min(0)
-
-    measurements = normalized[None, :, None]
-    height, width = counts.shape[-2:]
-else:
-    height = width = 64
-
-img_size = (1, height, width)
-
-
 # %%
 # Synthetic projected object
 # --------------------------
@@ -162,50 +156,11 @@ img_size = (1, height, width)
 # :math:`T=\exp(-\mu-\mathrm{i}\phi)`. Optimizing these dimensionless
 # quantities is usually better conditioned than optimizing the very small
 # refractive-index decrements directly.
-phase_true = None
-absorption_true = None
-transmission_true = None
-
-if not using_measured_data:
-    axis_y = torch.linspace(-1, 1, height, device=device)
-    axis_x = torch.linspace(-1, 1, width, device=device)
-    grid_y, grid_x = torch.meshgrid(axis_y, axis_x, indexing="ij")
-
-    disk = ((grid_x + 0.18).square() + (grid_y + 0.08).square() < 0.32**2).float()
-    small_disk = ((grid_x - 0.30).square() + (grid_y - 0.22).square() < 0.14**2).float()
-    smooth_feature = torch.exp(
-        -((grid_x - 0.20).square() + (grid_y + 0.28).square()) / 0.08
-    )
-
-    phase_true = (0.9 * disk - 0.55 * small_disk + 0.35 * smooth_feature)[None, None]
-    absorption_true = (0.10 * disk + 0.04 * small_disk)[None, None]
-    transmission_true = torch.exp(-absorption_true - 1j * phase_true)
 
 
 # %%
-# Multi-distance intensity measurements
+# Plot Multi-distance intensity measurements
 # -------------------------------------
-#
-# ``B`` is linear in the complex transmission. The existing
-# :class:`deepinv.physics.PhaseRetrieval` class then adds the detector
-# intensity :math:`|BT|^2`.
-B = MultiDistanceFresnel(
-    img_size=img_size,
-    distances=distances,
-    wavelength=wavelength,
-    pixel_size=pixel_size,
-    device=device,
-)
-transmission_phase_retrieval = dinv.physics.PhaseRetrieval(B=B)
-
-if not using_measured_data:
-    with torch.no_grad():
-        clean_intensity = transmission_phase_retrieval.A(transmission_true)
-        photons_per_pixel = 2.0e4
-        measurements = (
-            torch.poisson(photons_per_pixel * clean_intensity) / photons_per_pixel
-        )
-
 fig, axes = plt.subplots(1, len(distances), figsize=(10, 3))
 for index, (axis, distance) in enumerate(zip(axes, distances, strict=True)):
     image = axis.imshow(measurements[0, index, 0].cpu(), cmap="gray")
@@ -225,7 +180,7 @@ plt.show()
 # This map is nonlinear, so it is composed *before* the phase-retrieval operator
 # and is not included in its linear operator ``B``.
 def parameters_to_transmission(parameters):
-    phase = parameters[:, 0:1]
+    phase = - F.softplus(parameters[:, 0:1])
     absorption = F.softplus(parameters[:, 1:2])
     return torch.exp(-absorption - 1j * phase)
 
@@ -242,20 +197,14 @@ physics = dinv.physics.compose(transmission_model, transmission_phase_retrieval)
 # than a direct intensity MSE. Total variation supplies a modest spatial prior.
 # The mean phase is removed after every iteration because intensity measurements
 # cannot determine a global phase offset.
-def total_variation(x):
-    vertical = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
-    horizontal = (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
-    return vertical + horizontal
-
 
 parameters = torch.zeros(1, 2, height, width, device=device)
 parameters[:, 1].fill_(-5.0)  # softplus(-5) is weak initial absorption
 parameters = torch.nn.Parameter(parameters)
 
 optimizer = torch.optim.Adam([parameters], lr=0.05)
-valid_pixels = torch.isfinite(measurements) & (measurements >= 0)
 measurements = torch.nan_to_num(measurements, nan=0.0, posinf=0.0, neginf=0.0)
-
+L1prior = dinv.optim.prior.L1Prior()
 n_iter = 500
 loss_history = []
 for iteration in range(n_iter):
@@ -265,12 +214,11 @@ for iteration in range(n_iter):
     amplitude_residual = torch.sqrt(prediction.clamp_min(1e-8)) - torch.sqrt(
         measurements.clamp_min(0) + 1e-8
     )
-    data_loss = amplitude_residual[valid_pixels].square().mean()
+    data_loss = amplitude_residual.square().mean()
 
     phase = parameters[:, 0:1]
     absorption = F.softplus(parameters[:, 1:2])
-    regularization = 2e-4 * total_variation(phase) + 5e-4 * total_variation(absorption)
-    loss = data_loss + regularization
+    loss = data_loss +  2e-2 * L1prior(phase) + 5e-2 * L1prior(absorption)
     loss.backward()
     optimizer.step()
 
@@ -289,20 +237,23 @@ for iteration in range(n_iter):
 phase_estimate = parameters[:, 0:1].detach()
 absorption_estimate = F.softplus(parameters[:, 1:2]).detach()
 
-if using_measured_data:
-    fig, axes = plt.subplots(1, 2, figsize=(8, 3))
-    images = [phase_estimate, absorption_estimate]
-    titles = ["Estimated phase", "Estimated absorption"]
-else:
+if DATA_PATH is None:
     phase_reference = phase_true - phase_true.mean(dim=(-2, -1), keepdim=True)
-    fig, axes = plt.subplots(2, 2, figsize=(8, 7))
-    images = [phase_reference, phase_estimate, absorption_true, absorption_estimate]
+    fig, axes = plt.subplots(3, 2, figsize=(8, 7))
+    images = [phase_reference, phase_estimate, absorption_true, absorption_estimate, measurements[:, 0], prediction[:, 0].detach()]
     titles = [
         "True phase",
         "Estimated phase",
         "True absorption",
         "Estimated absorption",
+        "Measurement z0",
+        "Simulated Measurement z0",
     ]
+else:
+    fig, axes = plt.subplots(2, 2, figsize=(8, 3))
+    images = [phase_estimate, absorption_estimate, measurements[:, 0], prediction[:, 0].detach()]
+    titles = ["Estimated phase", "Estimated absorption",        "Measurement z0",
+        "Simulated Measurement z0",]
 
 for axis, image, title in zip(np.asarray(axes).ravel(), images, titles, strict=True):
     artist = axis.imshow(image[0, 0].cpu(), cmap="magma")
