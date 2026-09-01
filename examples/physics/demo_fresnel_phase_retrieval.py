@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 import deepinv as dinv
 
-torch.manual_seed(0)
+torch.manual_seed(42)
 device = dinv.utils.get_device()
 
 wavelength = 6.2e-11
@@ -95,6 +95,7 @@ class MultiDistanceFresnel(dinv.physics.LinearPhysics):
         # B^* B = n_distances I for the vertically stacked operator B.
         return self.A_adjoint(y) / len(self.propagators)
 
+
 # %%
 # Getting the data
 
@@ -115,7 +116,7 @@ if DATA_PATH is None:  # Generate synthetic data
     phase_true = (0.9 * disk + 0.55 * small_disk + 0.35 * smooth_feature)[None, None]
     absorption_true = (0.10 * disk + 0.04 * small_disk)[None, None]
     transmission_true = torch.exp(-absorption_true - 1j * phase_true)
-    
+
 
 else:  # Load measured data
     measurements = np.load(DATA_PATH)
@@ -136,11 +137,7 @@ transmission_phase_retrieval = dinv.physics.PhaseRetrieval(B=B)
 
 if DATA_PATH is None:
     with torch.no_grad():
-        clean_intensity = transmission_phase_retrieval.A(transmission_true)
-        photons_per_pixel = 2.0e4
-        measurements = (
-            torch.poisson(photons_per_pixel * clean_intensity) / photons_per_pixel
-        )
+        measurements = transmission_phase_retrieval.A(transmission_true)
 # %%
 # Synthetic projected object
 # --------------------------
@@ -180,7 +177,7 @@ plt.show()
 # This map is nonlinear, so it is composed *before* the phase-retrieval operator
 # and is not included in its linear operator ``B``.
 def parameters_to_transmission(parameters):
-    phase = - F.softplus(parameters[:, 0:1])
+    phase = F.softplus(parameters[:, 0:1])
     absorption = F.softplus(parameters[:, 1:2])
     return torch.exp(-absorption - 1j * phase)
 
@@ -188,6 +185,15 @@ def parameters_to_transmission(parameters):
 transmission_model = dinv.physics.Physics(A=parameters_to_transmission)
 physics = dinv.physics.compose(transmission_model, transmission_phase_retrieval)
 
+# %%
+dinv.utils.plot(
+    [
+        physics(torch.stack([phase_true, absorption_true], dim=2).squeeze(0)),
+        measurements,
+    ],
+    titles=["Simulated measurements", "measurements"],
+    cmap="gray",
+)
 
 # %%
 # Reconstruction
@@ -199,26 +205,24 @@ physics = dinv.physics.compose(transmission_model, transmission_phase_retrieval)
 # cannot determine a global phase offset.
 
 parameters = torch.zeros(1, 2, height, width, device=device)
-parameters[:, 1].fill_(-5.0)  # softplus(-5) is weak initial absorption
 parameters = torch.nn.Parameter(parameters)
 
 optimizer = torch.optim.Adam([parameters], lr=0.05)
-measurements = torch.nan_to_num(measurements, nan=0.0, posinf=0.0, neginf=0.0)
 L1prior = dinv.optim.prior.L1Prior()
-n_iter = 500
+n_iter = 1000
 loss_history = []
 for iteration in range(n_iter):
     optimizer.zero_grad()
     prediction = physics.A(parameters)
 
-    amplitude_residual = torch.sqrt(prediction.clamp_min(1e-8)) - torch.sqrt(
-        measurements.clamp_min(0) + 1e-8
+    amplitude_residual = torch.sqrt(prediction + 1e-16) - torch.sqrt(
+        measurements + 1e-16
     )
     data_loss = amplitude_residual.square().mean()
 
     phase = parameters[:, 0:1]
-    absorption = F.softplus(parameters[:, 1:2])
-    loss = data_loss +  2e-2 * L1prior(phase) + 5e-2 * L1prior(absorption)
+    absorption = parameters[:, 1:2]
+    loss = data_loss + 2e-2 * L1prior(phase) + 5e-1 * L1prior(absorption)
     loss.backward()
     optimizer.step()
 
@@ -240,7 +244,14 @@ absorption_estimate = F.softplus(parameters[:, 1:2]).detach()
 if DATA_PATH is None:
     phase_reference = phase_true - phase_true.mean(dim=(-2, -1), keepdim=True)
     fig, axes = plt.subplots(3, 2, figsize=(8, 7))
-    images = [phase_reference, phase_estimate, absorption_true, absorption_estimate, measurements[:, 0], prediction[:, 0].detach()]
+    images = [
+        phase_reference,
+        phase_estimate,
+        absorption_true,
+        absorption_estimate,
+        measurements[:, 0],
+        prediction[:, 0].detach(),
+    ]
     titles = [
         "True phase",
         "Estimated phase",
@@ -251,9 +262,18 @@ if DATA_PATH is None:
     ]
 else:
     fig, axes = plt.subplots(2, 2, figsize=(8, 3))
-    images = [phase_estimate, absorption_estimate, measurements[:, 0], prediction[:, 0].detach()]
-    titles = ["Estimated phase", "Estimated absorption",        "Measurement z0",
-        "Simulated Measurement z0",]
+    images = [
+        phase_estimate,
+        absorption_estimate,
+        measurements[:, 0],
+        prediction[:, 0].detach(),
+    ]
+    titles = [
+        "Estimated phase",
+        "Estimated absorption",
+        "Measurement z0",
+        "Simulated Measurement z0",
+    ]
 
 for axis, image, title in zip(np.asarray(axes).ravel(), images, titles, strict=True):
     artist = axis.imshow(image[0, 0].cpu(), cmap="magma")
