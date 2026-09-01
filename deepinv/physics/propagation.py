@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 import math
 
 import torch
 from torch import Tensor
 
 from deepinv.physics.forward import LinearPhysics
+from deepinv.utils._internal import _as_pair
 
 TransferFunction = Tensor | Callable[[Tensor, Tensor], Tensor]
 
@@ -80,7 +81,7 @@ class AngularSpectrumPropagation(LinearPhysics):
         self,
         img_size: tuple[int, ...],
         H: TransferFunction,
-        pixel_size: float | Sequence[float] = 1.0,
+        pixel_size: float | tuple[float, float] = 1.0,
         dtype: torch.dtype = torch.cfloat,
         device: torch.device | str = "cpu",
         **kwargs,
@@ -96,30 +97,17 @@ class AngularSpectrumPropagation(LinearPhysics):
             )
 
         self.spatial_shape = img_size[-2:]
-        self.pixel_size = self._to_pair(pixel_size, "pixel_size")
+        self.pixel_size = _as_pair(pixel_size)
         super().__init__(img_size=img_size, device=device, **kwargs)
 
         transfer_function = self._make_transfer_function(H, dtype=dtype, device=device)
         self._validate_transfer_function(transfer_function)
         self.register_buffer("H", transfer_function)
-        self.name = "Angular Spectrum Propagation"
-
-    @staticmethod
-    def _to_pair(value: float | Sequence[float], name: str) -> tuple[float, float]:
-        if isinstance(value, (int, float)):
-            pair = (float(value), float(value))
-        else:
-            pair = tuple(float(v) for v in value)
-            if len(pair) != 2:
-                raise ValueError(f"{name} must be a scalar or a pair, got {value}.")
-        if not all(math.isfinite(v) and v > 0 for v in pair):
-            raise ValueError(f"{name} entries must be positive and finite, got {pair}.")
-        return pair
 
     @staticmethod
     def frequency_grid(
         img_size: tuple[int, ...],
-        pixel_size: float | Sequence[float] = 1.0,
+        pixel_size: float | tuple[float, float] = 1.0,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cpu",
     ) -> tuple[Tensor, Tensor]:
@@ -136,17 +124,7 @@ class AngularSpectrumPropagation(LinearPhysics):
         :param torch.device, str device: Grid device.
         :return: The two grids ``(fx, fy)``, each of shape ``(height, width)``.
         """
-        img_size = tuple(img_size)
-        if len(img_size) < 2 or any(size <= 0 for size in img_size):
-            raise ValueError(
-                f"img_size must contain at least two positive entries, got {img_size}."
-            )
-        if dtype not in (torch.float32, torch.float64):
-            raise ValueError(
-                f"dtype must be torch.float32 or torch.float64, got {dtype}."
-            )
-
-        dy, dx = AngularSpectrumPropagation._to_pair(pixel_size, "pixel_size")
+        dy, dx = _as_pair(pixel_size)
         height, width = img_size[-2:]
         fy_values = torch.fft.fftfreq(height, d=dy, dtype=dtype, device=device)
         fx_values = torch.fft.fftfreq(width, d=dx, dtype=dtype, device=device)
@@ -295,7 +273,7 @@ class FresnelPropagation(AngularSpectrumPropagation):
         img_size: tuple[int, ...],
         wavelength: float,
         distance: float,
-        pixel_size: float | Sequence[float],
+        pixel_size: float | tuple[float, float],
         include_global_phase: bool = False,
         dtype: torch.dtype = torch.cfloat,
         device: torch.device | str = "cpu",
@@ -327,4 +305,3 @@ class FresnelPropagation(AngularSpectrumPropagation):
         self.wavelength = wavelength
         self.distance = distance
         self.include_global_phase = include_global_phase
-        self.name = "Fresnel Propagation"
