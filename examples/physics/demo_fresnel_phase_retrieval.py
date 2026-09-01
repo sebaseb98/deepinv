@@ -16,7 +16,6 @@ Fresnel propagation, detector blur and calibration, and Poisson shot noise.
 # ``j``.
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,6 +24,9 @@ import deepinv as dinv
 
 torch.manual_seed(0)
 device = dinv.utils.get_device()
+
+RESULTS_DIR = Path("results") / "fresnel_phase_retrieval"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 wavelength = 6.2e-11
 pixel_size = 1.0e-6
@@ -218,14 +220,16 @@ if not using_measured_data:
     with torch.no_grad():
         measurements = physics(true_parameters)
 
-fig, axes = plt.subplots(1, len(distances), figsize=(10, 3))
-for axis, distance, measurement in zip(axes, distances, measurements, strict=True):
-    image = axis.imshow(measurement[0, 0].cpu(), cmap="gray")
-    axis.set_title(f"z = {1e3 * distance:.0f} mm")
-    axis.axis("off")
-    fig.colorbar(image, ax=axis, fraction=0.046)
-plt.tight_layout()
-plt.show()
+dinv.utils.plot(
+    list(measurements),
+    titles=[f"z = {1e3 * distance:.0f} mm" for distance in distances],
+    save_fn=RESULTS_DIR / "measurements.png",
+    figsize=(10, 3),
+    cmap="gray",
+    cbar=True,
+    dpi=200,
+    close=True,
+)
 
 
 # %%
@@ -280,31 +284,36 @@ phase_estimate, absorption_estimate = parameters_to_material(parameters_estimate
 # Results
 # -------
 if using_measured_data:
-    fig, axes = plt.subplots(1, 2, figsize=(8, 3))
-    images = [phase_estimate, absorption_estimate]
-    titles = ["Estimated phase", "Estimated absorption"]
+    images = [phase_estimate / torch.pi, absorption_estimate]
+    titles = [r"Estimated phase ($\phi/\pi$)", "Estimated absorption"]
 else:
-    fig, axes = plt.subplots(2, 2, figsize=(8, 7))
-    images = [phase_true, phase_estimate, absorption_true, absorption_estimate]
+    images = [
+        phase_true / torch.pi,
+        phase_estimate / torch.pi,
+        absorption_true,
+        absorption_estimate,
+    ]
     titles = [
-        "True phase",
-        "Estimated phase",
+        r"True phase ($\phi/\pi$)",
+        r"Estimated phase ($\phi/\pi$)",
         "True absorption",
         "Estimated absorption",
     ]
 
-for axis, image, title in zip(np.asarray(axes).ravel(), images, titles, strict=True):
-    artist = axis.imshow(image[0, 0].detach().cpu(), cmap="magma")
-    axis.set_title(title)
-    axis.axis("off")
-    fig.colorbar(artist, ax=axis, fraction=0.046)
-plt.tight_layout()
-plt.show()
+dinv.utils.plot(
+    images,
+    titles=titles,
+    save_fn=RESULTS_DIR / "reconstruction.png",
+    figsize=(4 * len(images), 3.5),
+    cmap="magma",
+    cbar=True,
+    dpi=200,
+    close=True,
+)
 
 cost = np.asarray(metrics["cost"][0])
-plt.figure(figsize=(5, 3))
-plt.plot(cost - cost[0])
-plt.xlabel("Iteration")
-plt.ylabel("Objective change")
-plt.tight_layout()
-plt.show()
+dinv.utils.plot_curves(
+    {"Objective change": [(cost - cost[0]).tolist()]},
+    save_dir=RESULTS_DIR / "objective_history",
+)
+print(f"Saved figures to {RESULTS_DIR.resolve()}")
