@@ -2,58 +2,61 @@ r"""
 Multi-distance Fresnel phase retrieval
 ======================================
 
-This example reconstructs projected phase and absorption from flat-field-
-corrected intensities acquired at several object-to-detector distances. We
-assume an ideal detector and plane-wave illumination, so Poisson shot noise is
-the only detector effect.
+This example reconstructs projected phase from dark- and flat-field-corrected
+near-field holograms acquired at several propagation distances. It follows the
+pure-phase setting of `Huhn et al. (2022)
+<https://arxiv.org/abs/2205.01099>`_: the corrected data are fitted directly
+with an :math:`\ell_2` data term, without a photon-count calibration or an
+additional detector model.
 """
 
 # %%
 # Imports and acquisition parameters
 # ----------------------------------
 #
-# All lengths use metres. The wavelength corresponds approximately to a 20 keV
-# X-ray beam. ``distances[j]`` must describe the same plane as measurement
-# ``j``.
+# The defaults below match the four-distance polystyrene-microsphere data in
+# table 1 of the paper: 8 keV X-rays and a 196 nm effective pixel size. After
+# the cone-beam holograms are rescaled to a common magnification, their Fresnel
+# numbers define the equivalent plane-wave propagation distances used here via
+# :math:`z=\Delta x^2/(\lambda F)`.
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 import deepinv as dinv
 
-torch.manual_seed(0)
 device = dinv.utils.get_device()
 
 RESULTS_DIR = Path("results") / "fresnel_phase_retrieval"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-wavelength = 6.2e-11
-pixel_size = 1.0e-6
-distances = (0.01, 0.025, 0.05)
-photons_per_pixel = 2.0e4
-poisson_gain = 1.0 / photons_per_pixel
+wavelength = 1.5498e-10
+pixel_size = 196e-9
+fresnel_numbers = (1.59e-3, 1.57e-3, 1.49e-3, 1.33e-3)
 
 
 # %%
 # Using measured intensities
 # --------------------------
 #
-# Set ``MEASUREMENTS_PATH`` to the already dark- and flat-field-corrected
-# relative intensities with shape ``(n_distances, H, W)`` (the incident field is
-# normalized to one). ``photons_per_pixel`` is the corresponding effective
-# incident fluence. No calibration fields, detector blur, or additive background
-# are modelled.
-MEASUREMENTS_PATH: Path | None = None
+# ``holograms_beads_updated.npz`` contains the already dark- and flat-field-
+# corrected holograms under ``holograms`` and their matching Fresnel numbers
+# under ``fresnelNumbers``. The different distances have already been registered
+# and rescaled to a common magnification, and the incident intensity is
+# normalized to one. No calibration fields or raw detector counts are needed.
+MEASUREMENTS_PATH: Path | None = (
+    Path(__file__).resolve().parents[2] / "holograms_beads_updated.npz"
+)
 
 using_measured_data = MEASUREMENTS_PATH is not None
 measurements = None
 
 if using_measured_data:
-    corrected_intensity = (
-        torch.from_numpy(np.load(MEASUREMENTS_PATH)).float().to(device)
-    )
+    with np.load(MEASUREMENTS_PATH) as data:
+        corrected_intensity = torch.from_numpy(data["holograms"]).float().to(device)
+        fresnel_numbers = tuple(data["fresnelNumbers"].tolist())
+
     measurements = dinv.utils.TensorList(
         [measurement[None, None] for measurement in corrected_intensity]
     )
@@ -61,32 +64,37 @@ if using_measured_data:
 else:
     height = width = 64
 
+distances = tuple(
+    pixel_size**2 / (wavelength * fresnel_number) for fresnel_number in fresnel_numbers
+)
 img_size = (1, height, width)
 
 
 # %%
-# Projected object and parameterization
-# -------------------------------------
+# Projected phase model
+# ---------------------
 #
-# We optimize the dimensionless maps
+# We use the phase convention of the paper,
 #
 # .. math::
 #
-#     \phi=k\bar\delta, \qquad \mu=k\bar\beta,
+#     \phi=-k\bar\delta\leq0,
 #
-# where :math:`k=2\pi/\lambda`. For the convention used here,
-# :math:`\bar\delta\geq0` gives :math:`\phi\geq0`, while the phase angle of the
-# exit wave is :math:`-\phi`. The transmission for a plane-wave probe is
-# :math:`T=\exp(-\mu-\mathrm{i}\phi)`.
-axis_y = torch.linspace(-1, 1, height, device=device)
-axis_x = torch.linspace(-1, 1, width, device=device)
-grid_y, grid_x = torch.meshgrid(axis_y, axis_x, indexing="ij")
+# where :math:`k=2\pi/\lambda`. In the pure-phase approximation the plane-wave
+# transmission is :math:`T=\exp(\mathrm{i}\phi)`. Absorption is therefore set
+# to zero rather than reconstructed as an independent image.
+
+
+def phase_to_transmission(phase, **kwargs):
+    return torch.exp(1j * phase)
+
 
 phase_true = None
-absorption_true = None
-true_parameters = None
 
 if not using_measured_data:
+    axis_y = torch.linspace(-1, 1, height, device=device)
+    axis_x = torch.linspace(-1, 1, width, device=device)
+    grid_y, grid_x = torch.meshgrid(axis_y, axis_x, indexing="ij")
     phantom_region = (grid_x.square() + grid_y.square() < 0.75**2)[None, None]
 
     disk = ((grid_x + 0.18).square() + (grid_y + 0.08).square() < 0.32**2).float()
@@ -95,35 +103,10 @@ if not using_measured_data:
         -((grid_x - 0.20).square() + (grid_y + 0.28).square()) / 0.08
     )
 
-    phase_true = (0.9 * disk + 0.55 * small_disk + 0.35 * smooth_feature)[
-        None, None
-    ] * phantom_region
-    absorption_true = (
-        0.01 * phantom_region
-        + (0.10 * disk + 0.04 * small_disk)[None, None] * phantom_region
+    phase_true = -(
+        (0.9 * disk + 0.55 * small_disk + 0.35 * smooth_feature)[None, None]
+        * phantom_region
     )
-
-    phase_parameter = torch.log(torch.expm1(phase_true + 1e-6))
-    absorption_parameter = torch.log(torch.expm1(absorption_true.clamp_min(1e-6)))
-    true_parameters = torch.cat((phase_parameter, absorption_parameter), dim=1)
-
-
-# Fresnel intensities cannot determine a spatially constant phase offset. We
-# choose the representative with minimum phase zero; unlike mean-centering,
-# this gauge preserves the physical constraint phi >= 0 without requiring a
-# known support mask.
-def parameters_to_material(parameters):
-    """Map unconstrained parameters to projected phase and absorption."""
-    phase = F.softplus(parameters[:, 0:1])
-    phase = phase - phase.amin(dim=(-2, -1), keepdim=True)
-    absorption = F.softplus(parameters[:, 1:2])
-
-    return phase, absorption
-
-
-def parameters_to_transmission(parameters, **kwargs):
-    phase, absorption = parameters_to_material(parameters)
-    return torch.exp(-absorption - 1j * phase)
 
 
 # %%
@@ -136,15 +119,12 @@ def parameters_to_transmission(parameters, **kwargs):
 #
 # .. math::
 #
-#     \mathcal A_j(\phi,\mu)
-#     =\left|P_{z_j}[e^{-\mu-i\phi}]\right|^2.
+#     \mathcal A_j(\phi)
+#     =\left|P_{z_j}[e^{i\phi}]\right|^2.
 #
-# ``PoissonNoise`` is applied directly to each ideal intensity and returns
-# normalized counts
-# :math:`y_j=\gamma\operatorname{Poisson}(\mathcal A_j/\gamma)`, where
-# :math:`\gamma=1/n_{\mathrm{photons}}`. Thus Poisson shot noise is the only
-# detector model.
-transmission = dinv.physics.Physics(A=parameters_to_transmission)
+# The paper supplies corrected relative intensities rather than raw counts, so
+# the forward operators are deterministic and contain no detector noise model.
+transmission = dinv.physics.Physics(A=phase_to_transmission)
 plane_physics = []
 
 for distance in distances:
@@ -155,24 +135,18 @@ for distance in distances:
         pixel_size=pixel_size,
         device=device,
     )
-    intensity = dinv.physics.PhaseRetrieval(
-        B=propagation,
-        noise_model=dinv.physics.PoissonNoise(
-            gain=poisson_gain,
-            normalize=True,
-        ),
-    )
+    intensity = dinv.physics.PhaseRetrieval(B=propagation)
     plane_physics.append(dinv.physics.compose(transmission, intensity))
 
 physics = dinv.physics.stack(*plane_physics)
 
 if not using_measured_data:
     with torch.no_grad():
-        measurements = physics(true_parameters)
+        measurements = physics.A(phase_true)
 
 dinv.utils.plot(
     list(measurements),
-    titles=[f"z = {1e3 * distance:.0f} mm" for distance in distances],
+    titles=[rf"$F={fresnel_number:.2e}$" for fresnel_number in fresnel_numbers],
     save_fn=RESULTS_DIR / "measurements.png",
     figsize=(10, 3),
     cmap="gray",
@@ -183,75 +157,70 @@ dinv.utils.plot(
 
 
 # %%
-# Poisson reconstruction
-# ----------------------
+# Corrected-intensity reconstruction
+# ----------------------------------
 #
-# Since measurements and predictions are normalized intensities, we minimize
-# the Poisson negative log-likelihood per incident photon. This is the raw-count
-# likelihood divided by ``photons_per_pixel`` and therefore has the same
-# minimizer when the regularization weights are scaled consistently.
+# Following equation (7) of the paper, the corrected holograms are fitted with
+# squared :math:`\ell_2` residuals under the negative-phase constraint:
 #
-# The phase uses TV regularization. Absorption uses TV and an additional
-# :math:`\ell_1` term to reduce phase-absorption cross-talk.
+# .. math::
+#
+#     \widehat\phi
+#     =\underset{\phi\leq0}{\operatorname{argmin}}\;
+#     \frac12\sum_j\|\mathcal A_j(\phi)-y_j\|_2^2
+#     +\frac\alpha2\|\phi\|_2^2.
+#
+# The paper uses different Tikhonov weights for different frequency bands;
+# this compact example uses DeepInv's scalar Tikhonov prior.
 data_fidelity = dinv.optim.StackedPhysicsDataFidelity(
-    [dinv.optim.PoissonLikelihood(gain=1.0, denormalize=False) for _ in distances]
+    [dinv.optim.L2() for _ in distances]
 )
-tv_prior = dinv.optim.TVL1Prior()
-l1_prior = dinv.optim.L1Prior()
-
-lambda_phase_tv = 5e-2 / photons_per_pixel
-lambda_absorption_tv = 1e-1 / photons_per_pixel
-lambda_absorption_l1 = 5e-2 / photons_per_pixel
 
 
-def material_regularizer(parameters, *args, **kwargs):
-    phase, absorption = parameters_to_material(parameters)
-    return (
-        lambda_phase_tv * tv_prior(phase)
-        + lambda_absorption_tv * tv_prior(absorption)
-        + lambda_absorption_l1 * l1_prior(absorption)
-    )
+class NonPositiveTikhonov(dinv.optim.Tikhonov):
+    r"""Tikhonov prior whose proximal step also projects onto :math:`\phi\leq0`."""
+
+    def prox(self, x, *args, gamma=1.0, **kwargs):
+        return super().prox(x, gamma=gamma).clamp_max(0)
 
 
-prior = dinv.optim.Prior(g=material_regularizer)
-initial_parameters = torch.full((1, 2, height, width), -4.0, device=device)
+# The projection implements the paper's negative-phase range constraint. No
+# support constraint is imposed. Tikhonov regularization fixes the otherwise
+# unobservable spatially constant phase, so no mean subtraction is required.
+prior = NonPositiveTikhonov()
+initial_phase = torch.zeros(1, 1, height, width, device=device)
 
-reconstructor = dinv.optim.GD(
+reconstructor = dinv.optim.PGD(
     data_fidelity=data_fidelity,
     prior=prior,
-    lambda_reg=1.0,
-    stepsize=2e-5 * photons_per_pixel,
-    max_iter=300,
+    lambda_reg=1e-3,
+    stepsize=0.4,
+    max_iter=100,
     backtracking=dinv.optim.BacktrackingConfig(eta=0.5, max_iter=10),
 )
 
-parameters_estimate, metrics = reconstructor(
+phase_estimate, metrics = reconstructor(
     measurements,
     physics,
-    init=initial_parameters,
+    init=initial_phase,
     compute_metrics=True,
 )
-phase_estimate, absorption_estimate = parameters_to_material(parameters_estimate)
 
 
 # %%
 # Results
 # -------
 if using_measured_data:
-    images = [phase_estimate / torch.pi, absorption_estimate]
-    titles = [r"Estimated phase ($\phi/\pi$)", "Estimated absorption"]
+    images = [phase_estimate / torch.pi]
+    titles = [r"Estimated phase ($\phi/\pi$)"]
 else:
     images = [
         phase_true / torch.pi,
         phase_estimate / torch.pi,
-        absorption_true,
-        absorption_estimate,
     ]
     titles = [
         r"True phase ($\phi/\pi$)",
         r"Estimated phase ($\phi/\pi$)",
-        "True absorption",
-        "Estimated absorption",
     ]
 
 dinv.utils.plot(
