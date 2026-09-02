@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.constants import h, c
 
 import deepinv as dinv
 
@@ -29,9 +30,9 @@ device = dinv.utils.get_device()
 RESULTS_DIR = Path("results") / "fresnel_phase_retrieval"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-wavelength = 6.2e-11
-pixel_size = 1.0e-6
-distances = (0.01, 0.025, 0.05)
+wavelength = h * c / 8e3  # 8 keV
+pixel_size = 6.5e-6 / 33.1  # 6.5 um detector pixel size, 33.1x magnification
+distances = (156e-3, 158e-3, 166e-3, 187e-3)
 photons_per_pixel = 2.0e4
 poisson_gain = 1.0 / photons_per_pixel
 
@@ -45,15 +46,16 @@ poisson_gain = 1.0 / photons_per_pixel
 # normalized to one). ``photons_per_pixel`` is the corresponding effective
 # incident fluence. No calibration fields, detector blur, or additive background
 # are modelled.
-MEASUREMENTS_PATH: Path | None = None
+MEASUREMENTS_PATH: Path | None = Path(
+    "/data/dust/user/eberlese/Github/random-PhD-stuff/datasets/holograms_beads_updated.npz"
+)
 
 using_measured_data = MEASUREMENTS_PATH is not None
 measurements = None
 
 if using_measured_data:
-    corrected_intensity = (
-        torch.from_numpy(np.load(MEASUREMENTS_PATH)).float().to(device)
-    )
+    with np.load(MEASUREMENTS_PATH) as data:
+        corrected_intensity = torch.from_numpy(data["holograms"]).float().to(device)
     measurements = dinv.utils.TensorList(
         [measurement[None, None] for measurement in corrected_intensity]
     )
@@ -199,7 +201,7 @@ data_fidelity = dinv.optim.StackedPhysicsDataFidelity(
 tv_prior = dinv.optim.TVL1Prior()
 l1_prior = dinv.optim.L1Prior()
 
-lambda_phase_tv = 5e-2 / photons_per_pixel
+lambda_phase_l1 = 0 * 5e-2 / photons_per_pixel
 lambda_absorption_tv = 1e-1 / photons_per_pixel
 lambda_absorption_l1 = 5e-2 / photons_per_pixel
 
@@ -207,7 +209,7 @@ lambda_absorption_l1 = 5e-2 / photons_per_pixel
 def material_regularizer(parameters, *args, **kwargs):
     phase, absorption = parameters_to_material(parameters)
     return (
-        lambda_phase_tv * tv_prior(phase)
+        lambda_phase_l1 * l1_prior(phase)
         + lambda_absorption_tv * tv_prior(absorption)
         + lambda_absorption_l1 * l1_prior(absorption)
     )
@@ -223,6 +225,7 @@ reconstructor = dinv.optim.GD(
     stepsize=2e-5 * photons_per_pixel,
     max_iter=300,
     backtracking=dinv.optim.BacktrackingConfig(eta=0.5, max_iter=10),
+    verbose=True,
 )
 
 parameters_estimate, metrics = reconstructor(
