@@ -211,16 +211,16 @@ phase_estimate, metrics = reconstructor(
 # Results
 # -------
 if using_measured_data:
-    images = [phase_estimate / torch.pi]
-    titles = [r"Estimated phase ($\phi/\pi$)"]
+    images = [phase_estimate]
+    titles = [r"Estimated phase ($\phi$)"]
 else:
     images = [
-        phase_true / torch.pi,
-        phase_estimate / torch.pi,
+        phase_true,
+        phase_estimate,
     ]
     titles = [
-        r"True phase ($\phi/\pi$)",
-        r"Estimated phase ($\phi/\pi$)",
+        r"True phase ($\phi$)",
+        r"Estimated phase ($\phi$)",
     ]
 
 dinv.utils.plot(
@@ -228,7 +228,7 @@ dinv.utils.plot(
     titles=titles,
     save_fn=RESULTS_DIR / "reconstruction.png",
     figsize=(4 * len(images), 3.5),
-    cmap="magma",
+    cmap="bone",
     cbar=True,
     dpi=200,
     close=True,
